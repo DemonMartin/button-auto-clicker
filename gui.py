@@ -1,5 +1,7 @@
 """Button Auto Clicker - repeatedly presses a keyboard key or mouse button.
 
+Runs on Windows and macOS.
+
 All input (capturing, the global toggle hotkey and sending clicks/keys) goes
 through pynput, so no administrator rights are needed and key names are
 consistent everywhere.
@@ -85,14 +87,13 @@ class ClickConfig:
     hold_enabled: bool
 
 
-def click_loop(cfg, stop_event, errors):
-    """Worker thread: send the target input until stop_event is set."""
-    kb = keyboard.Controller()
-    ms = mouse.Controller()
-    if cfg.target.kind == "mouse":
-        press, release = ms.press, ms.release
-    else:
-        press, release = kb.press, kb.release
+def click_loop(cfg, controller, stop_event, errors):
+    """Worker thread: send the target input until stop_event is set.
+
+    The controller is created on the main thread: on macOS its constructor
+    queries the keyboard layout, which must not happen on a worker thread.
+    """
+    press, release = controller.press, controller.release
     value = cfg.target.value
     lo_d, hi_d = sorted((cfg.delay_min, cfg.delay_max))
     lo_h, hi_h = sorted((cfg.hold_min, cfg.hold_max))
@@ -154,13 +155,16 @@ class AutoClickerApp:
     # ----- UI construction -------------------------------------------------
 
     def _setup_style(self):
-        bg, panel, font = "#f5f5f5", "#ffffff", ("Segoe UI", 10)
+        bg, panel = "#f5f5f5", "#ffffff"
+        family = {"win32": "Segoe UI", "darwin": "Helvetica Neue"}.get(sys.platform, "TkDefaultFont")
+        size = 13 if sys.platform == "darwin" else 10  # macOS Tk points render smaller
+        font = (family, size)
         self.root.configure(bg=bg)
         style = ttk.Style(self.root)
         style.theme_use("clam")
         style.configure("TFrame", background=bg)
         style.configure("TLabelframe", background=panel)
-        style.configure("TLabelframe.Label", background=bg, font=("Segoe UI", 10, "bold"))
+        style.configure("TLabelframe.Label", background=bg, font=(family, size, "bold"))
         style.configure("TLabel", background=panel, font=font)
         style.configure("TButton", font=font, padding=6)
         style.configure("TCheckbutton", background=panel, font=font)
@@ -400,9 +404,10 @@ class AutoClickerApp:
         except ValueError as exc:
             messagebox.showwarning(APP_TITLE, str(exc))
             return
+        controller = mouse.Controller() if cfg.target.kind == "mouse" else keyboard.Controller()
         self.stop_event = threading.Event()
         self.worker = threading.Thread(target=click_loop,
-                                       args=(cfg, self.stop_event, self.events),
+                                       args=(cfg, controller, self.stop_event, self.events),
                                        daemon=True)
         self.worker.start()
         self._update_states()
@@ -428,6 +433,52 @@ class AutoClickerApp:
         self.root.destroy()
 
 
+def patch_macos_keyboard_layout():
+    """Avoid a crash on newer macOS with pynput's keyboard listener.
+
+    pynput reads the keyboard layout (Text Input Sources API) from its listener
+    thread, and recent macOS versions abort the process when that API is used
+    off the main thread. Read it once here, on the main thread, and hand the
+    cached result to pynput instead. The result is plain Python data.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        import contextlib
+        from pynput._util import darwin as util
+        from pynput.keyboard import _darwin as kbd
+
+        with util.keycode_context() as ctx:
+            cached = ctx
+
+        @contextlib.contextmanager
+        def cached_context():
+            yield cached
+
+        util.keycode_context = cached_context
+        kbd.keycode_context = cached_context
+    except Exception:  # never block startup on this; fall back to pynput's default
+        pass
+
+
+def warn_if_macos_untrusted(root):
+    """pynput silently receives/sends nothing on macOS without these permissions."""
+    if sys.platform != "darwin":
+        return
+    try:
+        import HIServices
+        trusted = HIServices.AXIsProcessTrusted()
+    except Exception:
+        return
+    if not trusted:
+        messagebox.showwarning(
+            APP_TITLE,
+            "Auto Clicker needs permission to read and send input.\n\n"
+            "Open System Settings > Privacy & Security and enable this app under "
+            "both 'Accessibility' and 'Input Monitoring', then restart it.",
+            parent=root)
+
+
 def enable_dpi_awareness():
     """Render crisply on high-DPI Windows displays instead of being bitmap-scaled."""
     if sys.platform != "win32":
@@ -441,8 +492,10 @@ def enable_dpi_awareness():
 
 def main():
     enable_dpi_awareness()
+    patch_macos_keyboard_layout()  # must run before any pynput listener starts
     root = tk.Tk()
     AutoClickerApp(root)
+    root.after(300, lambda: warn_if_macos_untrusted(root))
     root.mainloop()
 
 
